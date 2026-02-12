@@ -16,12 +16,13 @@ def get_data_from_sql():
     
     TABLA_RUTAS = "DWVEG_ORT.RMG_DIM_DISTANCIA"
     query = f"""
-        SELECT LOC_ORIGEN, LOC_DESTINO, DISTANCIA_KM, TIEMPO_MIN 
+        SELECT LOC_ORIGEN, LOC_DESTINO, DISTANCIA_KM, TIEMPO_MIN, COMPATIBILIDAD_SN
         FROM {TABLA_RUTAS}
     """
-    
     df = db.get_dataframe(query)
     
+
+
     if df.empty:
         raise Exception(f"La tabla {TABLA_RUTAS} está vacía.")
 
@@ -31,8 +32,8 @@ def get_data_from_sql():
     df['idx_origen'] = df['LOC_ORIGEN'].map(node_to_idx)
     df['idx_destino'] = df['LOC_DESTINO'].map(node_to_idx)
     
-    dist_matrix = df.pivot(index='idx_origen', columns='idx_destino', values='DISTANCIA_KM').fillna(0).values.tolist()
-    time_matrix = df.pivot(index='idx_origen', columns='idx_destino', values='TIEMPO_MIN').fillna(0).values.tolist()
+    dist_matrix = df.pivot(index='idx_origen', columns='idx_destino', values='DISTANCIA_KM').fillna(0).round().astype(int).values.tolist()
+    time_matrix = df.pivot(index='idx_origen', columns='idx_destino', values='TIEMPO_MIN').fillna(0).round().astype(int).values.tolist()
     
     print(f"✅ Matrices cargadas: {len(dist_matrix)} nodos.")
     
@@ -74,16 +75,16 @@ def create_data_model():
     
     data["demands"] = demands
     # Definimos que nodos son las entregas y cuales son las recogidas (ejemplo)
-    data["delivery_nodes"] = list(range(1, num_nodes))
-    data["pickup_nodes"] = []
+    data["delivery_nodes"] = delivery_nodes
+    data["pickup_nodes"] = pickup_nodes
 
-    # Capacidades de los vehículos
-    data["vehicle_capacities"] = [15, 15, 15, 15]
     
+    # Capacidades de los vehículos
+    data["num_vehicles"] = 15
+    data["vehicle_capacities"] = [100]*data["num_vehicles"]
     
     # Ventanas de tiempo (depósito + tiendas)
-    data["time_windows"] = [(0, 1440)] * num_nodes
-    data["num_vehicles"] = 4
+    data["time_windows"] = [(0, 14400)] * num_nodes
     data["depot"] = 0
     
     return data
@@ -165,8 +166,8 @@ def main():
     time_callback_index = routing.RegisterTransitCallback(time_callback)
     routing.AddDimension(
         time_callback_index,
-        5,    # slack permitido
-        1440,   # tiempo máximo
+        30,    # slack permitido (margen de espera)
+        20000, # tiempo máximo (aumentado para cubrir rutas largas)
         False,
         "Time"
     )
@@ -178,18 +179,34 @@ def main():
         time_dimension.CumulVar(index).SetRange(start, end)
 
     # REGLA: Forzar Entregas antes que Recogidas (Evitar Pickup -> Delivery)
-    for p in data["pickup_nodes"]:
-        p_index = manager.NodeToIndex(p)
-        for d in data["delivery_nodes"]:
-            d_index = manager.NodeToIndex(d)
-            # El siguiente nodo después de una recogida NO puede ser una entrega
-            routing.NextVar(p_index).RemoveValue(d_index)
+    # Usamos una dimensión de secuencia: cada recogida suma 1 punto.
+    def pickup_count_callback(from_index):
+        node = manager.IndexToNode(from_index)
+        return 1 if node in data["pickup_nodes"] else 0
 
+    pickup_count_index = routing.RegisterUnaryTransitCallback(pickup_count_callback)
+    routing.AddDimension(pickup_count_index, 0, len(data["pickup_nodes"]) + 1, True, "PickupSequence")
+    sequence_dimension = routing.GetDimensionOrDie("PickupSequence")
+
+    # En cada entrega, el contador de recogidas debe ser 0 para asegurar que no se ha recogido nada antes
+    for d in data["delivery_nodes"]:
+        d_index = manager.NodeToIndex(d)
+        sequence_dimension.CumulVar(d_index).SetMax(0)
+
+    # Añadimos penalizaciones para permitir omitir nodos si son imposibles de alcanzar (evita el "No se encontró solución")
+    penalty = 100000
+    for node in range(1, len(data["distance_matrix"])):
+        routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
 
     # Estrategia inicial de búsqueda
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    search_parameters.time_limit.seconds = 10
+    # Cambiamos a una estrategia más robusta para 400 nodos
+    search_parameters.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
+    # Añadimos metaheurística para mejorar la solución inicial
+    search_parameters.local_search_metaheuristic = (
+        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
+    search_parameters.time_limit.seconds = 30
     
     solution = routing.SolveWithParameters(search_parameters)
     
