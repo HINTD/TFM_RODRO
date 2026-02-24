@@ -114,14 +114,19 @@ def get_data_from_sql():
         # Creamos una visita (nodo) por cada ventana resultante
         for i, m_win in enumerate(merged):
             if m_win['win'][0] <= m_win['win'][1]: 
-                visits_list.append({
-                    'loc_id': node_id_real, 
-                    'start': m_win['win'][0], 
-                    'end': m_win['win'][1], 
-                    'type': 'client',
-                    'proceso': m_win['proceso'],
-                    'mce': carga_real if i == 0 else 0  # Asignamos la carga a la primera visita del día
-                })
+                # --- MODIFICACIÓN: FILTRADO DE VENTANAS SIN CARGA ---
+                carga_ventana = carga_real if i == 0 else 0
+                
+                # SOLO añadimos la visita si tiene carga > 0 
+                if carga_ventana > 0:
+                    visits_list.append({
+                        'loc_id': node_id_real, 
+                        'start': m_win['win'][0], 
+                        'end': m_win['win'][1], 
+                        'type': 'client',
+                        'proceso': m_win['proceso'],
+                        'mce': carga_ventana
+                    })
 
     # Añadimos los almacenes de recogida (Axxx)
     pickup_locs = df_dist[df_dist['LOC_DESTINO'].str.startswith('A')]['LOC_DESTINO'].unique()
@@ -440,10 +445,20 @@ def main():
         d_index = manager.NodeToIndex(d)
         sequence_dimension.CumulVar(d_index).SetMax(0)
 
+    # --- MODIFICACIÓN: PENALIZACIONES DINÁMICAS ---
     penalty = 100000
-    for node in range(0, len(data["distance_matrix"])):
-        if node != data["depot"]:
-            routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
+    for node_idx in range(0, len(data["distance_matrix"])):
+        if node_idx == data["depot"]:
+            continue
+            
+        node_data = data["visits_list"][node_idx]
+        
+        # Si es una entrega con carga o una recogida, penalización alta para forzar la visita.
+        if abs(data["demands"][node_idx]) > 0 or node_data['type'] == 'pickup':
+            routing.AddDisjunction([manager.NodeToIndex(node_idx)], penalty)
+        else:
+            # Si es un nodo sin carga, el modelo puede ignorarlo sin coste
+            routing.AddDisjunction([manager.NodeToIndex(node_idx)], 0)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (routing_enums_pb2.FirstSolutionStrategy.PATH_MOST_CONSTRAINED_ARC)
